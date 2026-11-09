@@ -180,3 +180,32 @@ limit kora hoy nai, bootstrap size 33 MB lekha (asol ~28 MB), ekta unused
 constant (`TERMUX_ARM32_BOOTSTRAP_TAG`) ase. Pro zip-er notun CI workflow
 `.github/workflows/build-apk.yml` repo-te dewa hoy nai — workflow file-er
 jonno GitHub App-er permission nai, website theke manually dite hobe.
+
+## Baki kaj shesh (2026-11-10) — Ubuntu URL + Gemini nit fix
+
+1. **Ubuntu 32-bit rootfs URL bosano hoise** (`LocalEnvironmentManager.kt`):
+   `UBUNTU_ROOTFS_URL_ARMHF` ekhon khali na — verified proot-distro v4.30.1
+   asset `ubuntu-questing-arm-pd-v4.30.1.tar.xz` (56,161,004 bytes, ~54 MB).
+   Asset-er nam `arm`, `armhf` na — armhf guess korle 404 asto. Standard
+   flavour + 32-bit ekhon ei URL use korbe, size ~54 MB dekhabe.
+2. **Gemini nit fix:** Termux bootstrap size 33 MB theke asol ~28 MB kora
+   hoise (exact 29,367,764 bytes); unused constant
+   `TERMUX_ARM32_BOOTSTRAP_TAG` sorano hoise; installer-er 32-bit default
+   (Base Minimum) ekhon sudhu Termux flavour-e apply hobe — standard
+   flavour-e Auto (Ubuntu flow) thakbe.
+3. **CI workflow toiri:** `.github/workflows/build-apk.yml` (Go `^1.26` kore
+   dewa, go.mod-er 1.26.5-er sathe milay) local copy-te rakha ase — kintu
+   workflow file GitHub App diye push kora jay na, GitHub website theke
+   manually upload korte hobe, `release.yml`-er moto.
+
+### Ekhono tomar kaj (manual, Muse korte parbe na)
+
+- GitHub website theke upload: `.github/workflows/release.yml`,
+  `.github/workflows/build-apk.yml`, ar 14 ta binary file (glibc tar,
+  splash png, proot/loader/libtalloc, 7 ta docs jpg, gradle-wrapper.jar).
+- Asol build + test: Java/Gradle/Android SDK thaka machine-e
+  `./gradlew :app:assembleTermuxDebug`, tarpor 32-bit device/emulator-e test.
+- Hard blocker ja code diye thik hobe na: 32-bit `agy` binary nai (Google
+  dey na — Direct Cloud Mode-i workaround), 32-bit Claude Code binary
+  ache kina unverified, ar 32-bit `proot`/`loader`/`libtalloc`/`glibc-min-arm.tar`
+  ekhono banate hobe.

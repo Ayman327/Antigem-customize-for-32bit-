@@ -73,7 +73,10 @@ fun FullScreenLocalToolsInstaller(
     }
 
     val is32BitDevice = remember { LocalEnvironmentManager.getBootstrapArch() == "arm" }
-    var selectedSourceType by remember { mutableStateOf(if (is32BitDevice) 1 else 0) } // 0: Auto GitHub, 1: Base Minimum (32-bit default), 2: Local ZIP File
+    // 32-bit default (Base Minimum) only on Termux flavour — the Base Minimum
+    // card is Termux-only, so on a 32-bit standard-flavour device the default
+    // stays Auto (Ubuntu rootfs flow).
+    var selectedSourceType by remember { mutableStateOf(if (is32BitDevice && LocalEnvironmentManager.isTermuxPackage(context)) 1 else 0) } // 0: Auto GitHub, 1: Base Minimum (32-bit Termux default), 2: Local ZIP File
     var directUrlText by remember { mutableStateOf("") }
     var selectedFileUri by remember { mutableStateOf<Uri?>(null) }
     var showLogs by remember { mutableStateOf(false) }

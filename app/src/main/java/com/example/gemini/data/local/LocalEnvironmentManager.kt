@@ -67,9 +67,9 @@ object LocalEnvironmentManager {
     const val HARDCODED_ROOTFS_SIZE_BYTES = 350 * 1024 * 1024L
 
     const val TERMUX_ARM32_BOOTSTRAP_URL = "https://github.com/termux/termux-packages/releases/download/bootstrap-2026.08.30-r1%2Bapt.android-7/bootstrap-arm.zip"
-    const val TERMUX_ARM32_BOOTSTRAP_TAG = "bootstrap-2026.08.30-arm"
     const val TERMUX_ARM32_BOOTSTRAP_ASSET = "bootstrap-arm.zip"
-    const val TERMUX_ARM32_BOOTSTRAP_SIZE_BYTES = 33 * 1024 * 1024L
+    // Exact size from the release: 29,367,764 bytes (~28 MB), verified 2026-11-09.
+    const val TERMUX_ARM32_BOOTSTRAP_SIZE_BYTES = 28 * 1024 * 1024L
 
     const val UBUNTU_ROOTFS_URL = "https://github.com/termux/proot-distro/releases/download/v4.30.1/ubuntu-questing-aarch64-pd-v4.30.1.tar.xz"
     const val UBUNTU_ROOTFS_TAG = "v4.30.1"
@@ -77,18 +77,14 @@ object LocalEnvironmentManager {
     const val UBUNTU_ROOTFS_SIZE_BYTES = 35 * 1024 * 1024L
 
     // 32-bit (armeabi-v7a) support — see README-32BIT.md.
-    // TODO (32-bit, MUST verify before shipping): the proot-distro v4.30.1
-    // armhf Ubuntu rootfs asset name/URL has NOT been verified against the
-    // termux/proot-distro v4.30.1 release assets. Do NOT guess it — open
-    // https://github.com/termux/proot-distro/releases/tag/v4.30.1, copy the
-    // exact armhf ubuntu-questing asset name, and fill in
-    // UBUNTU_ROOTFS_URL_ARMHF / UBUNTU_ROOTFS_ASSET_ARMHF below.
-    // Until then ubuntuRootfsForArch("arm") returns an empty URL and the
-    // installer logs the missing URL instead of downloading the arm64 rootfs
-    // onto a 32-bit device.
-    const val UBUNTU_ROOTFS_URL_ARMHF = ""
-    const val UBUNTU_ROOTFS_ASSET_ARMHF = ""
+    // Verified 2026-11-09 against the termux/proot-distro v4.30.1 release
+    // assets: the 32-bit asset is named "arm", NOT "armhf".
+    // https://github.com/termux/proot-distro/releases/tag/v4.30.1
+    // ubuntu-questing-arm-pd-v4.30.1.tar.xz, 56,161,004 bytes (~53.5 MB).
+    const val UBUNTU_ROOTFS_URL_ARMHF = "https://github.com/termux/proot-distro/releases/download/v4.30.1/ubuntu-questing-arm-pd-v4.30.1.tar.xz"
+    const val UBUNTU_ROOTFS_ASSET_ARMHF = "ubuntu-questing-arm-pd-v4.30.1.tar.xz"
     const val UBUNTU_ROOTFS_TAG_ARMHF = "v4.30.1"
+    const val UBUNTU_ROOTFS_SIZE_BYTES_ARMHF = 56161004L
 
     // Arch-aware helpers. getBootstrapArch() already returns "arm" for
     // armeabi devices and "aarch64" for arm64 — these build on it.
@@ -813,21 +809,19 @@ object LocalEnvironmentManager {
         } else {
             // 32-bit: use the arch detected by getBootstrapArch() instead of
             // the old hardcoded "arm64". For "arm" the URL/asset come from
-            // UBUNTU_ROOTFS_URL_ARMHF — see the TODO above: it is empty
-            // until the verified v4.30.1 armhf asset is filled in.
+            // UBUNTU_ROOTFS_URL_ARMHF — verified proot-distro v4.30.1 asset.
             val ubuntuUrl = if (arch == "arm") UBUNTU_ROOTFS_URL_ARMHF else UBUNTU_ROOTFS_URL
             val ubuntuAsset = if (arch == "arm") UBUNTU_ROOTFS_ASSET_ARMHF else UBUNTU_ROOTFS_ASSET
             val ubuntuTag = if (arch == "arm") UBUNTU_ROOTFS_TAG_ARMHF else UBUNTU_ROOTFS_TAG
-            if (arch == "arm" && ubuntuUrl.isBlank()) {
-                Log.w(TAG, "32-bit Ubuntu rootfs URL is not set yet (see UBUNTU_ROOTFS_URL_ARMHF TODO in LocalEnvironmentManager.kt). Fill in the verified proot-distro v4.30.1 armhf asset before installing on a 32-bit device.")
-            }
+            val ubuntuSizeBytes = if (arch == "arm") UBUNTU_ROOTFS_SIZE_BYTES_ARMHF else UBUNTU_ROOTFS_SIZE_BYTES
+            val ubuntuSizeFormatted = if (arch == "arm") "~54 MB" else "~29 MB"
             DiscoveredPackageInfo(
                 url = ubuntuUrl,
                 releaseTag = ubuntuTag,
                 assetName = ubuntuAsset,
                 arch = arch,
-                sizeBytes = UBUNTU_ROOTFS_SIZE_BYTES,
-                sizeFormatted = "~29 MB",
+                sizeBytes = ubuntuSizeBytes,
+                sizeFormatted = ubuntuSizeFormatted,
                 packageName = packageName
             )
         }
