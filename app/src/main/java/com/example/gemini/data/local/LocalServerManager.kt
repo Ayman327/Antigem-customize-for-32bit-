@@ -115,7 +115,13 @@ object LocalServerManager {
                 if (!binDir.exists()) {
                     binDir.mkdirs()
                 }
-                extractAssetToBin(context, binDir, "agy_ide_bridge")
+                val is32BitArm = LocalEnvironmentManager.getBootstrapArch() == "arm"
+                val bridgeAssetName = if (is32BitArm && context.assets.list("bin")?.contains("agy_ide_bridge_arm32") == true) {
+                    "agy_ide_bridge_arm32"
+                } else {
+                    "agy_ide_bridge"
+                }
+                extractAssetToBin(context, binDir, bridgeAssetName, targetFileName = "agy_ide_bridge")
                 try {
                     extractAssetToBin(context, binDir, "backup_bootstrap")
                 } catch (e: Exception) {

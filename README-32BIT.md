@@ -157,3 +157,26 @@ Prompt-er nam gulo asol code-e miliye neoa hoise — vul nam gulo use kora hoy n
   kina grep diye check kora hoise.
 - 32-bit phone-e live test kora hoy nai — agy chara cloud chat, Settings toggle,
   ar hub banner na dekha — ei 3 ta phone-e check korte hobe.
+
+## Gemini fix (2026-11-09) — AntiGem-32bit-Pro.zip theke newa
+
+Gemini amader copy te 4 ta file bodlaise, sob thik ase bole check kora hoise:
+
+1. `app/build.gradle.kts` — `preBuild` ekhon `buildAgyIdeBridge32bit`-o chalabe,
+   tai normal build-e 32-bit bridge bad porbe na.
+2. `data/local/LocalServerManager.kt` — 32-bit (`getBootstrapArch() == "arm"`)
+   hole assets theke `agy_ide_bridge_arm32` extract kore `agy_ide_bridge` hishebe
+   chalabe, na thakle ager binary-te fallback.
+3. `data/local/LocalEnvironmentManager.kt` — Termux flavour + 32-bit hole
+   `BootstrapSource.Auto` ekhon 350 MB rootfs-er bodle asol Termux arm
+   bootstrap (`bootstrap-arm.zip`, ~28 MB, release
+   bootstrap-2026.08.30-r1+apt.android-7) download korbe. Standard flavour-e
+   Ubuntu armhf URL ekhono khali (TODO), kono URL banano hoy nai.
+4. `ui/settings/FullScreenLocalToolsInstaller.kt` — 32-bit device-e installer
+   default source ekhon Base Minimum (~33 MB), Auto (~350 MB) na.
+
+Choto jinish ja ekhono thik kora hoy nai: installer default ta Termux flavour-e
+limit kora hoy nai, bootstrap size 33 MB lekha (asol ~28 MB), ekta unused
+constant (`TERMUX_ARM32_BOOTSTRAP_TAG`) ase. Pro zip-er notun CI workflow
+`.github/workflows/build-apk.yml` repo-te dewa hoy nai — workflow file-er
+jonno GitHub App-er permission nai, website theke manually dite hobe.

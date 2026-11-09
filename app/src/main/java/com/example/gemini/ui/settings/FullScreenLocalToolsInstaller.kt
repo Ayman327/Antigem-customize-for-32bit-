@@ -72,7 +72,8 @@ fun FullScreenLocalToolsInstaller(
         }
     }
 
-    var selectedSourceType by remember { mutableStateOf(0) } // 0: Auto GitHub, 1: Direct URL, 2: Local ZIP File
+    val is32BitDevice = remember { LocalEnvironmentManager.getBootstrapArch() == "arm" }
+    var selectedSourceType by remember { mutableStateOf(if (is32BitDevice) 1 else 0) } // 0: Auto GitHub, 1: Base Minimum (32-bit default), 2: Local ZIP File
     var directUrlText by remember { mutableStateOf("") }
     var selectedFileUri by remember { mutableStateOf<Uri?>(null) }
     var showLogs by remember { mutableStateOf(false) }

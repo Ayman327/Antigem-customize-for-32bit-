@@ -300,7 +300,7 @@ val copyScriptsToAssets = tasks.register<Copy>("copyScriptsToAssets") {
 }
 
 tasks.named("preBuild") {
-  dependsOn(buildAgyIdeBridge, copyScriptsToAssets)
+  dependsOn(buildAgyIdeBridge, buildAgyIdeBridge32bit, copyScriptsToAssets)
 }
 
 

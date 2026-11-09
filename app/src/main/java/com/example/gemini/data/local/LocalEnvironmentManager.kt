@@ -66,6 +66,11 @@ object LocalEnvironmentManager {
     const val HARDCODED_ROOTFS_ASSET = "bootrapz_2026-10-04.zip"
     const val HARDCODED_ROOTFS_SIZE_BYTES = 350 * 1024 * 1024L
 
+    const val TERMUX_ARM32_BOOTSTRAP_URL = "https://github.com/termux/termux-packages/releases/download/bootstrap-2026.08.30-r1%2Bapt.android-7/bootstrap-arm.zip"
+    const val TERMUX_ARM32_BOOTSTRAP_TAG = "bootstrap-2026.08.30-arm"
+    const val TERMUX_ARM32_BOOTSTRAP_ASSET = "bootstrap-arm.zip"
+    const val TERMUX_ARM32_BOOTSTRAP_SIZE_BYTES = 33 * 1024 * 1024L
+
     const val UBUNTU_ROOTFS_URL = "https://github.com/termux/proot-distro/releases/download/v4.30.1/ubuntu-questing-aarch64-pd-v4.30.1.tar.xz"
     const val UBUNTU_ROOTFS_TAG = "v4.30.1"
     const val UBUNTU_ROOTFS_ASSET = "ubuntu-questing-aarch64-pd-v4.30.1.tar.xz"
@@ -960,10 +965,27 @@ object LocalEnvironmentManager {
             when (source) {
                 is BootstrapSource.Auto -> {
                     val isTermux = isTermuxPackage(appContext)
-                    val targetUrl = if (isTermux) HARDCODED_ROOTFS_URL else UBUNTU_ROOTFS_URL
-                    val targetAsset = if (isTermux) HARDCODED_ROOTFS_ASSET else UBUNTU_ROOTFS_ASSET
-                    val targetSizeBytes = if (isTermux) HARDCODED_ROOTFS_SIZE_BYTES else UBUNTU_ROOTFS_SIZE_BYTES
-                    val titlePrefix = if (isTermux) "AntiGem Rootfs" else "Ubuntu Rootfs"
+                    val is32Bit = (arch == "arm")
+                    val targetUrl = if (isTermux) {
+                        if (is32Bit) TERMUX_ARM32_BOOTSTRAP_URL else HARDCODED_ROOTFS_URL
+                    } else {
+                        if (is32Bit) UBUNTU_ROOTFS_URL_ARMHF.ifBlank { UBUNTU_ROOTFS_URL } else UBUNTU_ROOTFS_URL
+                    }
+                    val targetAsset = if (isTermux) {
+                        if (is32Bit) TERMUX_ARM32_BOOTSTRAP_ASSET else HARDCODED_ROOTFS_ASSET
+                    } else {
+                        if (is32Bit) UBUNTU_ROOTFS_ASSET_ARMHF.ifBlank { UBUNTU_ROOTFS_ASSET } else UBUNTU_ROOTFS_ASSET
+                    }
+                    val targetSizeBytes = if (isTermux) {
+                        if (is32Bit) TERMUX_ARM32_BOOTSTRAP_SIZE_BYTES else HARDCODED_ROOTFS_SIZE_BYTES
+                    } else {
+                        UBUNTU_ROOTFS_SIZE_BYTES
+                    }
+                    val titlePrefix = if (isTermux) {
+                        if (is32Bit) "Termux 32-bit Rootfs" else "AntiGem Rootfs"
+                    } else {
+                        "Ubuntu Rootfs"
+                    }
 
                     _installerState.value = LocalInstallerState.Downloading(
                         bytesDownloaded = 0L,
