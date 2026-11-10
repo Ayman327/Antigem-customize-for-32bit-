@@ -276,10 +276,9 @@ val buildAgyIdeBridge32bit = tasks.register<Exec>("buildAgyIdeBridge32bit") {
 
   doFirst {
     binDir.asFile.mkdirs()
-    // Resolve the NDK: ANDROID_NDK_HOME first, then AGP's ndkDirectory
-    // (driven by ndkVersion), then $ANDROID_HOME/ndk/<version>.
+    // Resolve the NDK: ANDROID_NDK_HOME first (set by CI), then
+    // $ANDROID_HOME/ndk/<version>.
     val ndkDir = System.getenv("ANDROID_NDK_HOME")?.let { File(it) }?.takeIf { it.isDirectory }
-      ?: android.ndkDirectory.asFile.orNull
       ?: System.getenv("ANDROID_HOME")?.let { File(it, "ndk/27.2.12479018") }?.takeIf { it.isDirectory }
       ?: error(
         "Android NDK 27.2.12479018 not found. Set ANDROID_NDK_HOME or install it " +
