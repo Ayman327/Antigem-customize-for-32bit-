@@ -1,3 +1,5 @@
+name: Build 32-bit & 64-bit APKs
+
 on:
   push:
     branches:
@@ -29,6 +31,12 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android NDK
+        run: |
+          SDKMANAGER="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Make gradlew executable
         run: chmod +x gradlew scripts/*.sh
