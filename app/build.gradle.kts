@@ -21,6 +21,9 @@ plugins {
 android {
     namespace = "com.example.gemini"
     compileSdk = 36
+    // Pinned NDK: the 32-bit Go bridge links with the NDK's arm clang
+    // (see buildAgyIdeBridge32bit). AGP downloads this NDK if missing.
+    ndkVersion = "27.2.12479018"
     defaultConfig {
         applicationId = "com.antigem"
         minSdk = 24
@@ -257,20 +260,39 @@ val buildAgyIdeBridge = tasks.register<Exec>("buildAgyIdeBridge") {
 // Output is a separate file (agy_ide_bridge_arm32) so it never silently
 // overwrites the arm64 binary. When packaging a 32-bit-only APK, copy it
 // over src/main/assets/bin/agy_ide_bridge (that is the name the app loads).
-// NOT wired into preBuild — arm64 remains the default build.
+// Wired into preBuild alongside the 64-bit bridge.
+// NOTE: android/arm cannot use Go's internal linker, so this task MUST build
+// with cgo enabled and CC set to the NDK's armv7a clang. CGO_ENABLED=0 fails
+// with "android/arm requires external (cgo) linking, but cgo is not enabled".
 val buildAgyIdeBridge32bit = tasks.register<Exec>("buildAgyIdeBridge32bit") {
   val binDir = layout.projectDirectory.dir("src/main/assets/bin")
   val bridgeSourceDir = layout.projectDirectory.dir("../agy_ide_bridge")
-
-  doFirst {
-    binDir.asFile.mkdirs()
-  }
 
   workingDir = bridgeSourceDir.asFile
   environment("GOOS", "android")
   environment("GOARCH", "arm")
   environment("GOARM", "7")
-  environment("CGO_ENABLED", "0")
+  environment("CGO_ENABLED", "1")
+
+  doFirst {
+    binDir.asFile.mkdirs()
+    // Resolve the NDK: ANDROID_NDK_HOME first, then AGP's ndkDirectory
+    // (driven by ndkVersion), then $ANDROID_HOME/ndk/<version>.
+    val ndkDir = System.getenv("ANDROID_NDK_HOME")?.let { File(it) }?.takeIf { it.isDirectory }
+      ?: android.ndkDirectory.asFile.orNull
+      ?: System.getenv("ANDROID_HOME")?.let { File(it, "ndk/27.2.12479018") }?.takeIf { it.isDirectory }
+      ?: error(
+        "Android NDK 27.2.12479018 not found. Set ANDROID_NDK_HOME or install it " +
+          "with: sdkmanager \"ndk;27.2.12479018\""
+      )
+    // API 24 matches the app's minSdk.
+    val clang = File(ndkDir, "toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang")
+    if (!clang.isFile) {
+      error("NDK clang not found at ${clang.absolutePath}")
+    }
+    environment("CC", clang.absolutePath)
+  }
+
   commandLine("go", "build", "-ldflags=-s -w", "-o", binDir.file("agy_ide_bridge_arm32").asFile.absolutePath, "main.go")
 }
 
