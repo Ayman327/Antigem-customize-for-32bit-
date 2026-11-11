@@ -2429,7 +2429,7 @@ class AgyChatBackend(
         val msg = _messages.value.find { it.id == messageId } ?: return null
         val updatedCalls = msg.toolCalls.map { if (it.id == toolCallId) transform(it) else it }
         withContext(Dispatchers.Main) {
-            updateAssistantMessage(msgId = messageId, toolCalls = updatedCalls, forceImmediate = true)
+            updateAssistantMessage(msgId = messageId, content = msg.content, toolCalls = updatedCalls, isStreaming = false, forceImmediate = true)
         }
         return _messages.value.find { it.id == messageId }
     }
