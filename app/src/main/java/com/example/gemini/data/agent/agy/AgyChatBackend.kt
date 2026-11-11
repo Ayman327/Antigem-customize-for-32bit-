@@ -30,10 +30,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.encodeToString
 import android.util.Log
 import org.json.JSONObject
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
+import java.io.File
+import com.example.gemini.data.file.FileToolExecutor
+import com.example.gemini.data.file.LocalFileToolExecutor
+import com.example.gemini.data.local.LocalEnvironmentManager
 import com.example.gemini.data.agent.AgentChatBackend
 import com.example.gemini.domain.model.AgentKind
 import com.example.gemini.data.agent.ChatSessionStore
@@ -89,6 +95,82 @@ class AgyChatBackend(
     private val _isDirectCloudMode = MutableStateFlow(false)
     val isDirectCloudMode: StateFlow<Boolean> = _isDirectCloudMode.asStateFlow()
 
+    // ---- Direct Cloud tool loop -------------------------------------------------
+    // The model is told (via toolInstruction) to emit tool calls as <tool_call>
+    // tags in its streamed text, or as structured functionCall parts. A finished
+    // turn that asked for tools never runs them: the calls are attached to the
+    // assistant message as PENDING_APPROVAL and the turn pauses. Only a user
+    // approval in the chat runs them locally (bash via LocalEnvironmentManager,
+    // files via LocalFileToolExecutor), after which the stream resumes with the
+    // results in history.
+
+    /** Max tool-calling turns per user prompt in Direct Cloud Mode (counted across approval resumes). */
+    private val maxDirectCloudToolTurns = 10
+
+    /** Tool-calling turns already used per assistant message id. */
+    private val directCloudToolTurns = mutableMapOf<String, Int>()
+
+    /**
+     * Synthetic stepIndex values for Direct Cloud tool calls. Hub trajectory
+     * steps are >= 0, so negatives can never collide — and they mark a call as
+     * "local, no daemon", which approve/rejectTerminalTool branch on.
+     */
+    private val nextCloudToolStepIndex = AtomicInteger(-1)
+
+    /** Tool format the Direct Cloud model is told about (sent as toolInstruction). */
+    private val directCloudToolInstruction = """
+        You can use tools when the user's request needs the phone's terminal or its files. Emit each tool call exactly like this, one tag per call:
+        <tool_call name="bash">ls -la ~/projects</tool_call>
+        <tool_call name="read_file">{"path": "projects/notes.txt"}</tool_call>
+        <tool_call name="write_file">{"path": "projects/notes.txt", "content": "new text", "expected_hash": "abc123"}</tool_call>
+        <tool_call name="edit_file">{"path": "projects/notes.txt", "old_str": "old", "new_str": "new", "expected_hash": "abc123"}</tool_call>
+        <tool_call name="list_dir">{"path": "projects"}</tool_call>
+        Rules: paths are relative to the Termux home directory unless absolute; always read a file before writing or editing it and pass the hash from that read (use "NEW" as expected_hash for a file that does not exist yet); every tool call waits for the user's approval before it runs, so after the results come back, continue the task in your reply; never claim a command ran until its output is returned to you.
+    """.trimIndent()
+
+    /** One tool request parsed from a Direct Cloud turn (from <tool_call> text or an SSE functionCall part). */
+    private data class ParsedCloudToolCall(val name: String, val argsText: String)
+
+    private val cloudToolCallRegex = Regex("<tool_call\\s+name=\"([^\"]+)\">([\\s\\S]*?)</tool_call>")
+
+    /** Remove <tool_call> tags from text shown in the chat (the calls live on as ToolCall entries). */
+    private fun stripCloudToolCallTags(text: String): String =
+        text.replace(cloudToolCallRegex, "").trim()
+
+    private fun parseCloudToolCallsFromText(text: String): List<ParsedCloudToolCall> =
+        cloudToolCallRegex.findAll(text)
+            .map { ParsedCloudToolCall(it.groupValues[1].trim(), it.groupValues[2].trim()) }
+            .toList()
+
+    /** Convert a structured functionCall event into the same shape as a <tool_call> tag. */
+    private fun parsedCloudToolCallFromSse(event: StreamEvent.ToolCall): ParsedCloudToolCall {
+        val args = event.args
+        return when (event.name) {
+            "run_command", "bash" -> {
+                val command = try {
+                    args?.get("command")?.jsonPrimitive?.content
+                } catch (_: Exception) {
+                    null
+                } ?: args?.toString().orEmpty()
+                ParsedCloudToolCall("bash", command)
+            }
+            else -> ParsedCloudToolCall(event.name, args?.toString() ?: "{}")
+        }
+    }
+
+    private fun cloudToolTypeFor(name: String): com.example.gemini.domain.model.ToolType = when (name) {
+        "bash", "run_command" -> com.example.gemini.domain.model.ToolType.BASH
+        "read_file" -> com.example.gemini.domain.model.ToolType.VIEW_FILE
+        "write_file", "edit_file" -> com.example.gemini.domain.model.ToolType.EDIT_FILE
+        "list_dir" -> com.example.gemini.domain.model.ToolType.LIST_DIR
+        else -> com.example.gemini.domain.model.ToolType.UNKNOWN
+    }
+
+    /** Cap tool output stored on the message so a huge command result cannot blow up the next request. */
+    private fun String.truncateForToolOutput(limit: Int = 8000): String =
+        if (length <= limit) this else take(limit) + "\n... [output truncated to $limit characters]"
+    // ---- end Direct Cloud tool loop ---------------------------------------------
+
     /** True when Antigravity must use Direct Cloud: explicit "cloud" choice, or 32-bit ARM by default. */
     suspend fun shouldUseDirectCloud(): Boolean {
         val mode = authPrefs.antigravityMode.firstOrNull()
@@ -128,20 +210,140 @@ class AgyChatBackend(
     }
 
     /**
-     * Direct Cloud Mode stream: streams TextChunk / ThoughtChunk from
-     * AntigravityApiService.streamGenerateContent into the same ChatMessage the hub path uses,
-     * via updateAssistantMessage — so live streaming, the thinking accordion (thoughtText) and
-     * markdown rendering in Compose are identical to hub mode.
+     * Direct Cloud Mode with a client-side tool loop: streams TextChunk /
+     * ThoughtChunk from AntigravityApiService.streamGenerateContent into the
+     * same ChatMessage the hub path uses, via updateAssistantMessage — so live
+     * streaming, the thinking accordion (thoughtText) and markdown rendering
+     * in Compose are identical to hub mode.
      *
-     * Honest limit: this API streams text + thought only. It has no Cascade / tool-call parity:
-     * no file edits, no terminal commands, no tool approvals and no subagent turns come back from
-     * streamGenerateContent — the reply is a plain chat answer, not an agentic run.
+     * Tool loop: the model is told (via toolInstruction) to emit tool calls
+     * as <tool_call name="..."> tags, or as structured functionCall parts.
+     * A finished turn that asked for tools does NOT run them: the calls are
+     * attached to the assistant message as PENDING_APPROVAL and the turn
+     * pauses. Only when the user approves in the chat (see
+     * approveAndExecuteTerminalTool) does the call run locally — bash via
+     * LocalEnvironmentManager.executeCommand, files via
+     * LocalFileToolExecutor — and the stream resumes with the results in
+     * history. The loop is capped at [maxDirectCloudToolTurns] tool-calling
+     * turns per user prompt (counted across approval resumes).
      */
     private suspend fun executeDirectCloudStream(
         conv: Conversation,
         currentHistory: List<ChatMessage>,
-        assistantMsgId: String
+        assistantMsgId: String,
+        priorText: String = ""
     ) {
+        val turnsUsed = directCloudToolTurns.getOrDefault(assistantMsgId, 0)
+        val allowTools = turnsUsed < maxDirectCloudToolTurns
+        val result = streamOneDirectCloudTurn(
+            conv = conv,
+            history = currentHistory,
+            assistantMsgId = assistantMsgId,
+            priorText = priorText,
+            toolInstruction = if (allowTools) directCloudToolInstruction else null
+        )
+        if (result.error != null) {
+            withContext(Dispatchers.Main) {
+                _isStreaming.value = false
+                isPromptInFlight = false
+                updateAssistantMessage(msgId = assistantMsgId, content = result.error, isStreaming = false, forceImmediate = true)
+            }
+            directCloudToolTurns.remove(assistantMsgId)
+            return
+        }
+        val toolCalls = result.toolCalls
+        if (toolCalls.isEmpty()) {
+            withContext(Dispatchers.Main) {
+                _isStreaming.value = false
+                isPromptInFlight = false
+                updateAssistantMessage(
+                    msgId = assistantMsgId,
+                    content = stripCloudToolCallTags(result.text),
+                    thought = result.thought.ifBlank { null },
+                    thoughtDuration = if (result.thought.isNotEmpty()) System.currentTimeMillis() - result.thoughtStartMs else null,
+                    isStreaming = false,
+                    tokenUsage = result.tokenUsage,
+                    forceImmediate = true
+                )
+                com.example.gemini.ui.chat.ChatFeedCache.prewarm(_messages.value)
+            }
+            directCloudToolTurns.remove(assistantMsgId)
+            return
+        }
+        if (!allowTools) {
+            // Tool-call turn limit reached: do not create more approvals.
+            withContext(Dispatchers.Main) {
+                _isStreaming.value = false
+                isPromptInFlight = false
+                updateAssistantMessage(
+                    msgId = assistantMsgId,
+                    content = stripCloudToolCallTags(result.text) +
+                        "\n\n[Tool-call limit reached for this reply ($maxDirectCloudToolTurns turns) — the tools above were not run. Send a new message to continue.]",
+                    thought = result.thought.ifBlank { null },
+                    thoughtDuration = if (result.thought.isNotEmpty()) System.currentTimeMillis() - result.thoughtStartMs else null,
+                    isStreaming = false,
+                    tokenUsage = result.tokenUsage,
+                    forceImmediate = true
+                )
+                com.example.gemini.ui.chat.ChatFeedCache.prewarm(_messages.value)
+            }
+            directCloudToolTurns.remove(assistantMsgId)
+            return
+        }
+        // Tool calls requested: attach them as PENDING_APPROVAL and pause.
+        // Nothing runs until the user approves in the chat.
+        directCloudToolTurns[assistantMsgId] = turnsUsed + 1
+        val existing = _messages.value.find { it.id == assistantMsgId }
+        val pending = toolCalls.map { parsed ->
+            com.example.gemini.domain.model.ToolCall(
+                name = parsed.name,
+                toolType = cloudToolTypeFor(parsed.name),
+                command = parsed.argsText,
+                status = "PENDING_APPROVAL",
+                stepIndex = nextCloudToolStepIndex.getAndDecrement()
+            )
+        }
+        withContext(Dispatchers.Main) {
+            _isStreaming.value = false
+            isPromptInFlight = false
+            updateAssistantMessage(
+                msgId = assistantMsgId,
+                content = stripCloudToolCallTags(result.text),
+                thought = result.thought.ifBlank { null },
+                thoughtDuration = if (result.thought.isNotEmpty()) System.currentTimeMillis() - result.thoughtStartMs else null,
+                toolCalls = (existing?.toolCalls ?: emptyList()) + pending,
+                isStreaming = false,
+                tokenUsage = result.tokenUsage,
+                forceImmediate = true
+            )
+            com.example.gemini.ui.chat.ChatFeedCache.prewarm(_messages.value)
+        }
+    }
+
+    /** Result of one streaming pass of Direct Cloud Mode. Never finalizes the message itself. */
+    private data class CloudTurnResult(
+        val text: String,
+        val thought: String,
+        val thoughtStartMs: Long,
+        val toolCalls: List<ParsedCloudToolCall>,
+        val tokenUsage: com.example.gemini.domain.model.TokenUsage?,
+        /** Full message content to show when set (already formatted). */
+        val error: String?
+    )
+
+    /**
+     * One streaming pass of Direct Cloud Mode: token/model resolution and the
+     * TextChunk/ThoughtChunk/ToolCall/Completed/Error handling, returning the
+     * collected text, thought, tool calls and usage so the caller can decide
+     * whether to finalize, pause for approval, or resume the loop.
+     */
+    private suspend fun streamOneDirectCloudTurn(
+        conv: Conversation,
+        history: List<ChatMessage>,
+        assistantMsgId: String,
+        priorText: String,
+        toolInstruction: String?
+    ): CloudTurnResult {
         _isDirectCloudMode.value = true
         val token = getValidDirectCloudToken()
         if (token.isNullOrBlank()) {
@@ -150,12 +352,8 @@ class AgyChatBackend(
                 userMessage = "Direct Cloud Mode needs a Google sign-in. Sign in under Settings → Account, then try again.",
                 shortError = "Please sign in to send messages."
             )
-            withContext(Dispatchers.Main) {
-                _isStreaming.value = false
-                isPromptInFlight = false
-                updateAssistantMessage(msgId = assistantMsgId, content = err, isStreaming = false, forceImmediate = true)
-            }
-            return
+            _isDirectCloudMode.value = false
+            return CloudTurnResult("", "", System.currentTimeMillis(), emptyList(), null, err)
         }
 
         val projectId = authPrefs.projectId.firstOrNull()?.takeIf { it.isNotBlank() }
@@ -178,29 +376,29 @@ class AgyChatBackend(
                 userMessage = "Pick an Antigravity model in Settings before sending a message.",
                 shortError = "No model selected."
             )
-            withContext(Dispatchers.Main) {
-                _isStreaming.value = false
-                isPromptInFlight = false
-                updateAssistantMessage(msgId = assistantMsgId, content = err, isStreaming = false, forceImmediate = true)
-            }
-            return
+            _isDirectCloudMode.value = false
+            return CloudTurnResult("", "", System.currentTimeMillis(), emptyList(), null, err)
         }
         val selectedModel = _enabledModels.value.find { it.id == modelId }
         val supportsThinking = selectedModel?.supportsThinking
             ?: (modelId.contains("thinking", ignoreCase = true) || modelId.contains("flash", ignoreCase = true) || modelId.contains("pro", ignoreCase = true))
 
-        val textBuilder = StringBuilder()
+        val textBuilder = StringBuilder(priorText)
         val thoughtBuilder = StringBuilder()
         val thoughtStartMs = System.currentTimeMillis()
+        val sseToolCalls = mutableListOf<ParsedCloudToolCall>()
+        var completedUsage: com.example.gemini.domain.model.TokenUsage? = null
+        var streamError: String? = null
         try {
             directCloudApi.streamGenerateContent(
                 token = token,
                 projectId = projectId,
                 modelId = modelId,
                 sessionId = conv.sessionId,
-                messages = currentHistory,
+                messages = history,
                 thinkingBudget = if (supportsThinking) 8192 else 0,
-                isThinkingEnabled = supportsThinking
+                isThinkingEnabled = supportsThinking,
+                toolInstruction = toolInstruction
             ).collect { event ->
                 when (event) {
                     is StreamEvent.TextChunk -> {
@@ -230,50 +428,44 @@ class AgyChatBackend(
                             )
                         }
                     }
+                    is StreamEvent.ToolCall -> {
+                        sseToolCalls.add(parsedCloudToolCallFromSse(event))
+                    }
                     is StreamEvent.Completed -> {
-                        withContext(Dispatchers.Main) {
-                            _isStreaming.value = false
-                            isPromptInFlight = false
-                            updateAssistantMessage(
-                                msgId = assistantMsgId,
-                                content = textBuilder.toString(),
-                                thought = thoughtBuilder.toString().ifBlank { null },
-                                thoughtDuration = if (thoughtBuilder.isNotEmpty()) System.currentTimeMillis() - thoughtStartMs else null,
-                                isStreaming = false,
-                                tokenUsage = event.tokenUsage,
-                                forceImmediate = true
-                            )
-                            com.example.gemini.ui.chat.ChatFeedCache.prewarm(_messages.value)
-                        }
+                        completedUsage = event.tokenUsage
                     }
                     is StreamEvent.Error -> {
-                        val err = formatStructuredErrorMessage(
+                        streamError = formatStructuredErrorMessage(
                             title = "Direct Cloud Error",
                             userMessage = event.message,
                             shortError = event.message
                         )
-                        withContext(Dispatchers.Main) {
-                            _isStreaming.value = false
-                            isPromptInFlight = false
-                            updateAssistantMessage(msgId = assistantMsgId, content = err, isStreaming = false, forceImmediate = true)
-                        }
                     }
                 }
             }
         } catch (e: Exception) {
-            val err = formatStructuredErrorMessage(
+            streamError = formatStructuredErrorMessage(
                 title = "Direct Cloud Error",
                 userMessage = e.message ?: "Unknown error",
                 shortError = e.message ?: ""
             )
-            withContext(Dispatchers.Main) {
-                _isStreaming.value = false
-                isPromptInFlight = false
-                updateAssistantMessage(msgId = assistantMsgId, content = err, isStreaming = false, forceImmediate = true)
-            }
         } finally {
             _isDirectCloudMode.value = false
         }
+
+        if (streamError != null) {
+            return CloudTurnResult(textBuilder.toString(), thoughtBuilder.toString(), thoughtStartMs, emptyList(), completedUsage, streamError)
+        }
+        val parsedFromText = parseCloudToolCallsFromText(textBuilder.toString())
+        val allTools = (parsedFromText + sseToolCalls).distinctBy { it.name to it.argsText }
+        return CloudTurnResult(
+            text = textBuilder.toString(),
+            thought = thoughtBuilder.toString(),
+            thoughtStartMs = thoughtStartMs,
+            toolCalls = allTools,
+            tokenUsage = completedUsage,
+            error = null
+        )
     }
     val speechManager = com.example.gemini.data.audio.AgyAudioTranscriptionManager(agyHubClient) {
         AuthPreferences.currentHubUrl
@@ -2072,6 +2264,13 @@ class AgyChatBackend(
         messageId: String,
         scope: String? = null
     ) {
+        // Direct Cloud Mode: tool calls created by executeDirectCloudStream carry
+        // a negative stepIndex (hub steps are >= 0). They have no daemon, so an
+        // approval executes them locally on this device instead of via the hub.
+        if ((toolCall.stepIndex ?: 0) < 0) {
+            approveAndExecuteCloudTool(toolCall, messageId)
+            return
+        }
         val conv = _currentConversation.value ?: return
         val stepIndex = toolCall.stepIndex ?: return
         val trajectoryId = toolCall.trajectoryId?.takeIf { it.isNotBlank() }
@@ -2110,6 +2309,10 @@ class AgyChatBackend(
     }
 
     fun rejectTerminalTool(toolCall: com.example.gemini.domain.model.ToolCall, messageId: String, reason: String? = null) {
+        if ((toolCall.stepIndex ?: 0) < 0) {
+            rejectCloudTool(toolCall, messageId, reason)
+            return
+        }
         val conv = _currentConversation.value ?: return
         val stepIndex = toolCall.stepIndex ?: return
         val trajectoryId = toolCall.trajectoryId?.takeIf { it.isNotBlank() }
@@ -2158,6 +2361,183 @@ class AgyChatBackend(
             rejectTerminalTool(approval.toolCall, approval.messageId, reason)
         }
     }
+
+    // ---- Direct Cloud tool execution -------------------------------------------
+    // Runs an approved Direct Cloud tool call locally on this device. Bash goes
+    // through LocalEnvironmentManager (Termux flavour skips proot, so it runs
+    // directly), files through LocalFileToolExecutor (same hash-lock contract
+    // as the SSH FileToolExecutor). When no PENDING_APPROVAL call remains on
+    // the message, the Direct Cloud stream resumes with the results in history.
+
+    private fun approveAndExecuteCloudTool(
+        toolCall: com.example.gemini.domain.model.ToolCall,
+        messageId: String
+    ) {
+        val startMs = System.currentTimeMillis()
+        backendScope.launch {
+            updateCloudToolCall(messageId, toolCall.id) { it.copy(status = "RUNNING") }
+            val (output, exitCode) = runCloudTool(toolCall)
+            val updated = updateCloudToolCall(messageId, toolCall.id) {
+                it.copy(
+                    status = if (exitCode == 0) "COMPLETED" else "FAILED",
+                    output = output.truncateForToolOutput(),
+                    exitCode = exitCode,
+                    durationMs = System.currentTimeMillis() - startMs
+                )
+            }
+            if (updated != null) resumeCloudAfterApproval(messageId)
+        }
+    }
+
+    private fun rejectCloudTool(
+        toolCall: com.example.gemini.domain.model.ToolCall,
+        messageId: String,
+        reason: String?
+    ) {
+        backendScope.launch {
+            updateCloudToolCall(messageId, toolCall.id) {
+                it.copy(
+                    status = "CANCELED",
+                    output = reason ?: "User rejected this tool call."
+                )
+            }
+            resumeCloudAfterApproval(messageId)
+        }
+    }
+
+    /** When no PENDING_APPROVAL call remains on the message, resume the Direct Cloud stream. */
+    private fun resumeCloudAfterApproval(messageId: String) {
+        val conv = _currentConversation.value ?: return
+        val msg = _messages.value.find { it.id == messageId } ?: return
+        if (msg.toolCalls.any { it.status == "PENDING_APPROVAL" }) return
+        backendScope.launch {
+            executeDirectCloudStream(
+                conv = conv,
+                currentHistory = _messages.value,
+                assistantMsgId = messageId,
+                priorText = stripCloudToolCallTags(msg.content)
+            )
+        }
+    }
+
+    /** Replace one ToolCall on a message and return the updated message, or null when not found. */
+    private suspend fun updateCloudToolCall(
+        messageId: String,
+        toolCallId: String,
+        transform: (com.example.gemini.domain.model.ToolCall) -> com.example.gemini.domain.model.ToolCall
+    ): ChatMessage? {
+        val msg = _messages.value.find { it.id == messageId } ?: return null
+        val updatedCalls = msg.toolCalls.map { if (it.id == toolCallId) transform(it) else it }
+        withContext(Dispatchers.Main) {
+            updateAssistantMessage(msgId = messageId, toolCalls = updatedCalls, forceImmediate = true)
+        }
+        return _messages.value.find { it.id == messageId }
+    }
+
+    /** Run one approved Direct Cloud tool call. Returns (output, exitCode). */
+    private suspend fun runCloudTool(
+        toolCall: com.example.gemini.domain.model.ToolCall
+    ): Pair<String, Int> {
+        val homeDir = File(application.filesDir, "home")
+        return when (toolCall.name) {
+            "bash", "run_command" -> {
+                val command = toolCall.command
+                try {
+                    val startMs = System.currentTimeMillis()
+                    val result = LocalEnvironmentManager.executeCommand(
+                        command = command,
+                        context = application.applicationContext,
+                        workingDir = homeDir.absolutePath
+                    )
+                    val duration = System.currentTimeMillis() - startMs
+                    val out = buildString {
+                        append("$ $command\n")
+                        append(result.output)
+                        append("\n[exit=${result.exitCode} in ${duration}ms]")
+                    }
+                    out to result.exitCode
+                } catch (e: Exception) {
+                    ("Error running command: ${e.message}") to 1
+                }
+            }
+            "read_file" -> {
+                val payload = try {
+                    FileToolExecutor.parseReadPayload(toolCall.command)
+                } catch (e: Exception) {
+                    return "Error: invalid read_file payload (${e.message})" to 1
+                }
+                val read = LocalFileToolExecutor.readFile(
+                    path = payload.path,
+                    homeDir = homeDir,
+                    startLine = payload.startLine,
+                    endLine = payload.endLine
+                )
+                read.fold(
+                    onSuccess = { FileToolExecutor.formatReadOutput(it) to 0 },
+                    onFailure = { "Error reading file: ${it.message}" to 1 }
+                )
+            }
+            "write_file" -> {
+                val payload = try {
+                    FileToolExecutor.parseWritePayload(toolCall.command)
+                } catch (e: Exception) {
+                    return "Error: invalid write_file payload (${e.message})" to 1
+                }
+                val write = LocalFileToolExecutor.writeFile(
+                    path = payload.path,
+                    content = payload.content,
+                    expectedHash = payload.expectedHash,
+                    homeDir = homeDir
+                )
+                write.fold(
+                    onSuccess = { FileToolExecutor.formatWriteOutput(it) to 0 },
+                    onFailure = { "Error writing file: ${it.message}" to 1 }
+                )
+            }
+            "edit_file" -> {
+                val payload = try {
+                    FileToolExecutor.parseEditPayload(toolCall.command)
+                } catch (e: Exception) {
+                    return "Error: invalid edit_file payload (${e.message})" to 1
+                }
+                val edit = LocalFileToolExecutor.editFile(
+                    path = payload.path,
+                    oldStr = payload.oldStr,
+                    newStr = payload.newStr,
+                    expectedHash = payload.expectedHash,
+                    homeDir = homeDir,
+                    replaceAll = payload.replaceAll
+                )
+                edit.fold(
+                    onSuccess = { FileToolExecutor.formatEditOutput(it) to 0 },
+                    onFailure = { "Error editing file: ${it.message}" to 1 }
+                )
+            }
+            "list_dir" -> {
+                val path = parseListDirPath(toolCall.command)
+                val list = LocalFileToolExecutor.listDir(path = path, homeDir = homeDir)
+                list.fold(
+                    onSuccess = { it to 0 },
+                    onFailure = { "Error listing directory: ${it.message}" to 1 }
+                )
+            }
+            else -> "Error: unsupported tool '${toolCall.name}'" to 1
+        }
+    }
+
+    /** Parse a list_dir payload: either {"path": "..."} or a bare path string. */
+    private fun parseListDirPath(argsText: String): String {
+        val trimmed = argsText.trim()
+        if (trimmed.startsWith("{")) {
+            try {
+                val obj = JSONObject(trimmed)
+                if (obj.has("path")) return obj.optString("path", "~")
+            } catch (_: Exception) {
+            }
+        }
+        return trimmed.ifBlank { "~" }
+    }
+    // ---- end Direct Cloud tool execution ---------------------------------------
 
     fun terminateRunningTerminalTool(toolCall: com.example.gemini.domain.model.ToolCall, messageId: String) {
         val conv = _currentConversation.value ?: return

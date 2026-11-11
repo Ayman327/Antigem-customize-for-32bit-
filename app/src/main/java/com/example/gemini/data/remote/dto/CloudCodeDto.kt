@@ -38,7 +38,19 @@ data class ContentPartDto(
 data class TextPartDto(
     val text: String? = null,
     val thought: Boolean? = null,
-    val thoughtSignature: String? = null
+    val thoughtSignature: String? = null,
+    /**
+     * Structured tool call from the server (Gemini API functionCall part), when the
+     * stream carries one. Absent for plain text/thought parts; unknown on the
+     * request side — history replay still uses <tool_call> text tags.
+     */
+    val functionCall: FunctionCallDto? = null
+)
+
+@Serializable
+data class FunctionCallDto(
+    val name: String,
+    val args: JsonObject? = null
 )
 
 // LoadCodeAssist Response

@@ -28,6 +28,12 @@ import java.util.concurrent.TimeUnit
 sealed class StreamEvent {
     data class TextChunk(val text: String) : StreamEvent()
     data class ThoughtChunk(val thought: String) : StreamEvent()
+    /**
+     * Structured tool call from the server (a functionCall part in the SSE
+     * stream). Only the Direct Cloud tool loop consumes it; other collectors
+     * ignore it via their existing else branch.
+     */
+    data class ToolCall(val name: String, val args: JsonObject? = null) : StreamEvent()
     data class Completed(val tokenUsage: com.example.gemini.domain.model.TokenUsage?, val rawPayload: String? = null) : StreamEvent()
     data class Error(val message: String) : StreamEvent()
 }
@@ -375,6 +381,13 @@ class AntigravityApiService(
                                 val parts = candidates?.firstOrNull()?.content?.parts
                                 if (parts != null) {
                                     for (part in parts) {
+                                        val fnCall = part.functionCall
+                                        if (fnCall != null) {
+                                            Log.d(TAG, "[SSE Function Call] ${fnCall.name}")
+                                            emit(StreamEvent.ToolCall(fnCall.name, fnCall.args))
+                                            chunkCount++
+                                            continue
+                                        }
                                         val isThoughtPart = part.thought == true || (!part.thoughtSignature.isNullOrEmpty() && part.thought != false)
                                         if (isThoughtPart && !part.text.isNullOrEmpty()) {
                                             Log.d(TAG, "[SSE Thought Chunk] ${part.text}")
